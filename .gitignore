@@ -1,6 +1,9 @@
 # Ignore CMake build files
 build/*
 
+# Ignore .vscode
+.vscode/* 
+
 # Prerequisites
 *.d
 

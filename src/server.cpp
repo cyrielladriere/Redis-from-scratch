@@ -1,60 +1,247 @@
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <cassert>
 #include <iostream>
-
-#include "utils.h"
+#include <vector>
 
 const size_t k_max_msg = 4096;  // bytes
 
-static int32_t one_request(int connection_fd) {
-    // 4 bytes header (request size) + msg + nullptr
-    char rbuf[4 + k_max_msg + 1];
-    errno = 0;
+enum {
+    STATE_REQ = 0,
+    STATE_RES = 1,
+    STATE_END = 2,  // mark the connection for deletion
+};
 
-    // Request header
-    int32_t err = read_full(connection_fd, rbuf, 4);
-    if (err) {
-        if (errno == 0) {
-        std:
-            std::cerr << "EOF error while reading request header" << std::endl;
-        } else {
-            std::cerr << "Read error while reading request header" << std::endl;
-        }
-        return err;
+struct Conn {
+    int fd = -1;
+    uint32_t state = 0;  // either STATE_REQ or STATE_RES
+    // buffer for reading
+    size_t rbuf_size = 0;
+    uint8_t rbuf[4 + k_max_msg];
+    // buffer for writing
+    size_t wbuf_size = 0;
+    size_t wbuf_sent = 0;
+    uint8_t wbuf[4 + k_max_msg];
+};
+
+static void fd_set_nb(int fd) {
+    errno = 0;
+    // Returns all file descriptor flags
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (errno) {
+        std::cerr << "Fcntl error when trying to retrieve file descriptor flags"
+                  << std::endl;
+        return;
     }
 
-    uint32_t len = 0;
+    flags |= O_NONBLOCK;
 
-    // copies n(=4) bytes (32 bits) from memory area src(=rbuf) to memory area
-    // dest(=&len). In this case, it copies the request size
-    memcpy(&len, rbuf, 4);  // assume little endian
-    if (len > k_max_msg) {
-        std::cerr << "Request size too large" << std::endl;
+    errno = 0;
+    // Set file descriptor with non-blocking mode flag on
+    (void)fcntl(fd, F_SETFL, flags);
+    if (errno) {
+        std::cerr << "Fcntl error when trying to set fd non-blocking mode"
+                  << std::endl;
+    }
+}
+
+static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
+    if (fd2conn.size() <= (size_t)conn->fd) {
+        fd2conn.resize(conn->fd + 1);
+    }
+    fd2conn[conn->fd] = conn;
+}
+
+static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
+    // accept
+    struct sockaddr_in client_addr = {};
+    socklen_t socklen = sizeof(client_addr);
+    int connection_fd = accept(fd, (struct sockaddr *)&client_addr, &socklen);
+    if (connection_fd < 0) {
+        std::cerr << "Accept error when accepting new connection" << std::endl;
         return -1;
     }
 
-    // Request body
-    // store in rbuf starting from index 4 (before [4] is the header)
-    err = read_full(connection_fd, &rbuf[4], len);
-    if (err) {
-        std::cerr << "Error while reading request body";
-        return err;
+    // set the new connection fd to nonblocking mode
+    fd_set_nb(connection_fd);
+    // creating the struct Conn
+    struct Conn *conn = (struct Conn *)malloc(sizeof(struct Conn));
+    if (!conn) {
+        close(connection_fd);
+        return -1;
+    }
+    conn->fd = connection_fd;
+    conn->state = STATE_REQ;
+    conn->rbuf_size = 0;
+    conn->wbuf_size = 0;
+    conn->wbuf_sent = 0;
+    conn_put(fd2conn, conn);
+    return 0;
+}
+
+static void state_res(Conn *conn);
+
+// Takes one request from the read buffer, generates a response, then transits
+// to the STATE_RES state.
+static bool try_one_request(Conn *conn) {
+    // try to parse a request from the buffer
+    if (conn->rbuf_size < 4) {
+        // not enough data in the buffer. Will retry in the next iteration
+        return false;
+    }
+    uint32_t len = 0;
+    // copies n(=4) bytes (32 bits) from memory area src(=&conn->rbuf[0]) to
+    // memory area dest(=&len). In this case, it copies the request size in
+    // bytes
+    memcpy(&len, &conn->rbuf[0], 4);
+    if (len > k_max_msg) {
+        std::cerr << "Request size too large" << std::endl;
+        conn->state = STATE_END;
+        return false;
+    }
+    if (4 + len > conn->rbuf_size) {
+        // Not enough data in the buffer. Will retry in the next iteration
+        return false;
     }
 
-    rbuf[4 + len] = '\0';                   // Insert null at end of message
-    printf("Client says: %s\n", &rbuf[4]);  // Read message
+    // got one client request
+    printf("Client says: %.*s\n", len, &conn->rbuf[4]);
 
-    // reply using the same protocol
-    const char *reply = "Hello, client!";
-    char wbuf[4 + sizeof(reply)];
-    len = (uint32_t)strlen(reply);
-    memcpy(wbuf, &len, 4);
-    memcpy(&wbuf[4], reply, len);
-    return write_all(connection_fd, wbuf, 4 + len);
+    // generating server echoing response
+    memcpy(&conn->wbuf[0], &len, 4);
+    memcpy(&conn->wbuf[4], &conn->rbuf[4], len);
+    conn->wbuf_size = 4 + len;
+
+    // remove the request from the buffer.
+    // note: frequent memmove is inefficient.
+    // note: need better handling for production code.
+    size_t remain = conn->rbuf_size - 4 - len;
+    if (remain) {
+        memmove(conn->rbuf, &conn->rbuf[4 + len], remain);
+    }
+    conn->rbuf_size = remain;
+
+    // change state
+    conn->state = STATE_RES;
+    state_res(conn);
+
+    // continue the outer loop if the request was fully processed
+    return (conn->state == STATE_REQ);
+}
+
+// Fills the read buffer with data until it gets EAGAIN
+static bool try_fill_buffer(Conn *conn) {
+    // rbuf_size initialized at 0 for a Conn
+    // Here we can interpret rbuf_size as total connection bytes read
+    assert(conn->rbuf_size < sizeof(conn->rbuf));
+    ssize_t n_bytes_read = 0;
+
+    // The EINTR means the syscall was interrupted by a signal, retrying is
+    // needed
+    do {
+        // Only read bytes that have not been read yet
+        size_t cap = sizeof(conn->rbuf) - conn->rbuf_size;
+        n_bytes_read = read(conn->fd, &conn->rbuf[conn->rbuf_size], cap);
+    } while (n_bytes_read < 0 && errno == EINTR);
+
+    if (n_bytes_read < 0 && errno == EAGAIN) {
+        // got EAGAIN, stop.
+        return false;
+    }
+    if (n_bytes_read < 0) {
+        std::cerr << "Read error when reading request" << std::endl;
+        conn->state = STATE_END;  // End connection
+        return false;
+    }
+    if (n_bytes_read == 0) {
+        if (conn->rbuf_size > 0) {
+            std::cerr << "Unexpected EOF error when reading request"
+                      << std::endl;
+        } else {
+            printf("EOF request\n");
+        }
+        conn->state = STATE_END;  // End connection
+        return false;
+    }
+
+    // Add the bytes that have been read to rbuf_size
+    conn->rbuf_size += (size_t)n_bytes_read;
+    assert(conn->rbuf_size <= sizeof(conn->rbuf));
+
+    // Try to process requests one by one, there can be more than one request in
+    // the read buffer. For a request/response protocol, clients are not limited
+    // to sending one request and waiting for the response at a time, clients
+    // can save some latency by sending multiple requests without waiting for
+    // responses in between, this mode of operation is called “pipelining”
+    while (try_one_request(conn)) {
+    }
+    return (conn->state == STATE_REQ);
+}
+
+// Flushes the write buffer until it gets EAGAIN, or transits back to the
+// STATE_REQ if the flushing is done
+static bool try_flush_buffer(Conn *conn) {
+    ssize_t n_bytes_read = 0;
+
+    // The EINTR means the syscall was interrupted by a signal, retrying is
+    // needed
+    do {
+        // conn->wbuf_sent: number of total bytes already sent in this
+        // connection
+        // remain: only send bytes that have not been sent yet
+        size_t remain = conn->wbuf_size - conn->wbuf_sent;
+        n_bytes_read = write(conn->fd, &conn->wbuf[conn->wbuf_sent], remain);
+    } while (n_bytes_read < 0 && errno == EINTR);
+
+    if (n_bytes_read < 0 && errno == EAGAIN) {
+        // got EAGAIN, stop.
+        return false;
+    }
+
+    if (n_bytes_read < 0) {
+        std::cerr << "Write error when sending request response" << std::endl;
+        conn->state = STATE_END;
+        return false;
+    }
+
+    // Add the bytes that have been written to wbuf_size
+    conn->wbuf_sent += (size_t)n_bytes_read;
+    assert(conn->wbuf_sent <= conn->wbuf_size);
+
+    if (conn->wbuf_sent == conn->wbuf_size) {
+        // response was fully sent, change state back
+        conn->state = STATE_REQ;
+        conn->wbuf_sent = 0;
+        conn->wbuf_size = 0;
+        return false;
+    }
+    // still got some data in wbuf, could try to write again
+    return true;
+}
+
+static void state_req(Conn *conn) {
+    while (try_fill_buffer(conn)) {
+    }
+}
+
+static void state_res(Conn *conn) {
+    while (try_flush_buffer(conn)) {
+    }
+}
+
+static void connection_io(Conn *conn) {
+    if (conn->state == STATE_REQ) {
+        state_req(conn);
+    } else if (conn->state == STATE_RES) {
+        state_res(conn);
+    } else {
+        assert(0);  // not expected
+    }
 }
 
 int main() {
@@ -91,29 +278,70 @@ int main() {
         return 1;
     }
 
-    // The server enters a loop that accepts and processes each connection,
-    // multiple requests from the same connection is supported.
+    // A map of all client connections, keyed by fd
+    std::vector<Conn *> fd2conn;
+
+    // Set the listen server_fd to nonblocking mode
+    fd_set_nb(server_fd);
+
+    // The event loop
+    std::vector<struct pollfd> poll_args;
     while (true) {
-        struct sockaddr_in client_addr = {};
-        socklen_t addrlen = sizeof(client_addr);
+        // Prepare the arguments of the poll()
+        poll_args.clear();
 
-        int connection_fd =
-            accept(server_fd, (struct sockaddr *)&client_addr, &addrlen);
+        // For convenience, the listening server_fd is put in the first position
+        // POLLIN flag just specifies that the poll fd is for reading data
+        struct pollfd poll_fd = {server_fd, POLLIN, 0};
+        poll_args.push_back(poll_fd);
 
-        if (connection_fd < 0) {
-            // Skip this connection, go to next in queue
-            continue;
+        // Connection fds, first iteration does not enter this loop
+        for (Conn *conn : fd2conn) {
+            if (!conn) {
+                continue;
+            }
+            struct pollfd pfd = {};
+            pfd.fd = conn->fd;
+            // POLLIN flag: fd will read data (STATE_REQ: reading request)
+            // POLLOUT flag: fd will write data (STATE_RES: sending response)
+            // Never reading AND writing
+            // pollfd.events: requested events
+            pfd.events = (conn->state == STATE_REQ) ? POLLIN : POLLOUT;
+            pfd.events = pfd.events | POLLERR;
+            poll_args.push_back(pfd);
         }
 
-        // Only handle one client connection at a time, all requests from this
-        // connection will be handled before moving on.
-        while (true) {
-            int32_t err = one_request(connection_fd);
-            if (err) {
-                break;
+        // Poll for active fds
+        // Waits for one of a set of file descriptors (poll_args.data() = active
+        // fds) to become ready to perform I/O.
+        // The timeout argument doesn't matter here
+        int n_bytes_read = poll(poll_args.data(), (nfds_t)poll_args.size(),
+                                1000);  // (active_fds, n_fds, timeout)
+        if (n_bytes_read < 0) {
+            std::cerr << "Error during poll for active file descriptors"
+                      << std::endl;
+        }
+
+        // process active connections
+        for (size_t i = 1; i < poll_args.size(); ++i) {
+            // pollfd.revents: returned events
+            if (poll_args[i].revents) {  // Checks if connection is active
+                Conn *conn = fd2conn[poll_args[i].fd];
+                connection_io(conn);
+                if (conn->state == STATE_END) {
+                    // client closed normally, or something bad happened.
+                    // destroy this connection
+                    fd2conn[conn->fd] = NULL;
+                    (void)close(conn->fd);
+                    free(conn);
+                }
             }
         }
-        close(connection_fd);
+
+        // try to accept a new connection if the listening fd is active
+        if (poll_args[0].revents) {
+            (void)accept_new_conn(fd2conn, server_fd);
+        }
     }
 
     return 0;

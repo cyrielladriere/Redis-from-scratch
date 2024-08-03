@@ -38,3 +38,9 @@ When we execute `./build/redis_server`, the server is started and it will listen
 
 We can see that after each client connection (when all client requests are already handled by the server), the server currently detects an EOF error when trying to check the next request header. This is because this next request does not exist. After the error is detected, the server breaks the client connection. Finally, the server will either accept the next client connection in queue or wait for another client connection if the queue is empty.
 
+# Todo
+- Fix EOF request error in server after each request
+- Make rescodes more readible when printed on client
+- Use epoll instead of poll in the event loop. Should be better.
+- In `try_one_request` function in `server.cpp` make `memmove` use more efficient.
+

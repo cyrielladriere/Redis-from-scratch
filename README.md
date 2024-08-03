@@ -2,7 +2,7 @@
 Building and understanding Redis from scratch using C/C++.
 
 Current capabilities:
-- Create a socket server and client, implemented in `server.cpp` and `client.cpp`.
+- Create a socket server and client, implemented in `src/server.cpp` and `src/client.cpp`.
 - Both server and client can communicate bidirectionally (messages are printed out in the terminal).
  
 # Building the project

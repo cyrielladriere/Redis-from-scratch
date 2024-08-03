@@ -3,7 +3,18 @@ Building and understanding Redis from scratch using C/C++.
 
 Current capabilities:
 - Create a socket server and client, implemented in `src/server.cpp` and `src/client.cpp`.
-- Both server and client can communicate bidirectionally (messages are printed out in the terminal).
+- Both server and client can communicate bidirectionally. Client communicates with server through commands, server to client with response codes.
+- Server can store data
+
+Supported commands:
+- `set key value`: This will save a key-value pair on the server
+- `get key`: This will retrieve the value corresponding to the `key` from the server. (If key does not exist server-side, server will respond with `rescode`: \[2\])
+- `del key`: This will delete the key-value pair from server-side.
+
+`Rescodes`:
+- \[0\]: `RES_OK`, request was handled without issues.
+- \[1\]: `RES_ERR`, there was an error during the handling of the request (e.g.: Unknown command). 
+- \[2\]: `RES_NX`, key mentioned in request not found server-side.
  
 # Building the project
 The project is built using CMake, you can build it yourself using the following commands:
@@ -17,7 +28,7 @@ Now you should have two executables located in the `build/` directory:
 2) `redis_client.exe`: Executed with `./build/redis_client`, this runs the `client`. The client can: write request, read answer from the server, then close the connection (or send another request).
 
 # Example
-When we execute `./build/redis_server`, the server is started and it will listen for any connections. When we execute `./build/redis_client` afterwards, the client will communicate with the server and shut down (the server will keep running and listen for other connections).
+When we execute `./build/redis_server`, the server is started and it will listen for any connections. When we execute `./build/redis_client` afterwards, we can execute commands to the server.
 
 `Client`:
 ![client example](readme_img/client_example.PNG)
